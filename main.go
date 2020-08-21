@@ -145,10 +145,9 @@ func main() {
 					logs.Log.TryError(session.Close())
 				})
 
-			},
-				func() {
-					logs.Log.TryError(sshClient.Close())
-				})
+			}, func() {
+				logs.Log.TryError(sshClient.Close())
+			})
 
 		}, func() {
 			logs.Log.TryError(sshconn.Close())
