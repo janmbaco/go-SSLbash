@@ -1,12 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"flag"
-	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -17,6 +15,7 @@ import (
 	"github.com/janmbaco/go-infrastructure/errorhandler"
 	"github.com/janmbaco/go-infrastructure/logs"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/terminal"
 )
 
 var (
@@ -52,6 +51,7 @@ func GetTlsConfig() *tls.Config {
 
 func ConnectToProxy(conn net.Conn) {
 	req, _ := http.NewRequest("CONNECT", *sshUrl, nil)
+	req.RequestURI = *sshUrl
 	req.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(*basicAuthentication)))
 
 	dumpReq, err := httputil.DumpRequest(req, false)
@@ -81,53 +81,17 @@ func GetSshConfig() *ssh.ClientConfig {
 
 func GetSSHTerminalModes() ssh.TerminalModes {
 	return ssh.TerminalModes{
-		ssh.ECHO:          0,     // disable echoing
+		ssh.ECHO:          1,     // disable echoing
 		ssh.TTY_OP_ISPEED: 14400, // input speed = 14.4kbaud
 		ssh.TTY_OP_OSPEED: 14400, // output speed = 14.4kbaud
 	}
 }
 
-func ConnectPipes(dst io.Writer, src io.Reader) {
-	_, err := io.Copy(dst, src)
-	logs.Log.TryError(err)
-}
-
-func PreparePipes(session *ssh.Session) io.WriteCloser {
-	stdin, err := session.StdinPipe()
+func PrepareTerminal() (int, *terminal.State) {
+	fd := int(os.Stdin.Fd())
+	state, err := terminal.MakeRaw(fd)
 	errorhandler.TryPanic(err)
-
-	stdout, err := session.StdoutPipe()
-	errorhandler.TryPanic(err)
-	go ConnectPipes(os.Stdout, stdout)
-
-	stderr, err := session.StderrPipe()
-	errorhandler.TryPanic(err)
-	go ConnectPipes(os.Stderr, stderr)
-
-	return stdin
-}
-
-func readFromPrompt(stdin io.WriteCloser) {
-	cmds := read(os.Stdin)
-	for cmd := range cmds {
-		_, err := stdin.Write([]byte(cmd + "\n"))
-		errorhandler.TryPanic(err)
-		if cmd == "exit" {
-			break
-		}
-	}
-}
-
-func read(r io.Reader) <-chan string {
-	lines := make(chan string)
-	go func() {
-		defer close(lines)
-		scan := bufio.NewScanner(r)
-		for scan.Scan() {
-			lines <- scan.Text()
-		}
-	}()
-	return lines
+	return fd, state
 }
 
 func main() {
@@ -152,15 +116,30 @@ func main() {
 				errorhandler.TryPanic(err)
 				errorhandler.TryFinally(func() {
 
-					errorhandler.TryPanic(session.RequestPty("bash", 80, 40, GetSSHTerminalModes()))
+					fd, state := PrepareTerminal()
+					errorhandler.TryFinally(func() {
 
-					stdIn := PreparePipes(session)
+						w, h, err := terminal.GetSize(fd)
+						errorhandler.TryPanic(err)
 
-					errorhandler.TryPanic(session.Shell())
+						term := os.Getenv("TERM")
+						if term == "" {
+							term = "xterm-256color"
+						}
 
-					readFromPrompt(stdIn)
+						errorhandler.TryPanic(session.RequestPty(term, h, w, GetSSHTerminalModes()))
 
-					errorhandler.TryPanic(session.Wait())
+						session.Stdout = os.Stdout
+						session.Stderr = os.Stderr
+						session.Stdin = os.Stdin
+
+						errorhandler.TryPanic(session.Shell())
+
+						errorhandler.TryPanic(session.Wait())
+
+					}, func() {
+						logs.Log.TryError(terminal.Restore(fd, state))
+					})
 
 				}, func() {
 					logs.Log.TryError(session.Close())
